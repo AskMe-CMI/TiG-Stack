@@ -33,6 +33,29 @@ function check_os {
     fi
 }
 
+function install_dependencies {
+    log "Checking required dependencies..."
+    local install_list=""
+    
+    if ! command -v openssl &> /dev/null; then
+        install_list="$install_list openssl"
+    fi
+    
+    if ! command -v curl &> /dev/null; then
+        install_list="$install_list curl"
+    fi
+
+    if [ -n "$install_list" ]; then
+        log "Installing missing dependencies:$install_list"
+        if [[ "$PKG_MGR" == "apt-get" ]]; then
+            sudo $PKG_MGR update
+            sudo $PKG_MGR install -y $install_list
+        elif [[ "$PKG_MGR" == "dnf" ]]; then
+            sudo $PKG_MGR install -y $install_list
+        fi
+    fi
+}
+
 function install_docker {
     log "Installing Docker..."
 
@@ -357,6 +380,7 @@ function checkup_influx {
 # Main Execution Logic
 
 check_os
+install_dependencies
 
 # Check if Docker is installed
 if ! command -v docker &> /dev/null; then
