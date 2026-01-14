@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Global variables
+export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 OS=""
 PKG_MGR=""
 DISTRO=""
@@ -23,6 +24,8 @@ function check_os {
     else
         error_exit "/etc/os-release not found. Unsupported OS."
     fi
+    
+    log "Detected OS: $OS, Distro: $DISTRO"
 
     if [[ "$OS" =~ ^(ubuntu|debian)$ ]]; then
         PKG_MGR="apt-get"
@@ -37,13 +40,17 @@ function install_dependencies {
     log "Checking required dependencies..."
     local install_list=""
     
-    if ! command -v openssl &> /dev/null; then
-        install_list="$install_list openssl"
-    fi
-    
-    if ! command -v curl &> /dev/null; then
-        install_list="$install_list curl"
-    fi
+    # dependencies array: "binary_command:package_name"
+    # Note: gnupg package provides 'gpg' command
+    deps=("openssl:openssl" "curl:curl" "gpg:gnupg")
+
+    for entry in "${deps[@]}"; do
+        cmd="${entry%%:*}"
+        pkg="${entry##*:}"
+        if ! command -v "$cmd" &> /dev/null; then
+            install_list="$install_list $pkg"
+        fi
+    done
 
     if [ -n "$install_list" ]; then
         log "Installing missing dependencies:$install_list"
@@ -53,6 +60,22 @@ function install_dependencies {
         elif [[ "$PKG_MGR" == "dnf" ]]; then
             sudo $PKG_MGR install -y $install_list
         fi
+        
+        # Determine if installations succeeded
+        for entry in "${deps[@]}"; do
+             cmd="${entry%%:*}"
+             pkg="${entry##*:}"
+             # Only check if we tried to install this package (simple string match check)
+             if [[ "$install_list" == *"$pkg"* ]]; then
+                if ! command -v "$cmd" &> /dev/null; then
+                     # Try hash -r to refresh shell cache
+                     hash -r
+                     if ! command -v "$cmd" &> /dev/null; then
+                         error_exit "Failed to install $pkg (command '$cmd' not found). Please install manually."
+                     fi
+                fi
+             fi
+        done
     fi
 }
 
