@@ -1,22 +1,39 @@
 #!/bin/bash
 set -euo pipefail
 
-# Global variables
+# =============================================================================
+# TiG Stack Setup Script (Telegraf, InfluxDB, Grafana)
+# Supports: Ubuntu, Debian, CentOS, RHEL, AlmaLinux, Rocky, Fedora, Oracle Linux, OpenSUSE/SLES
+# =============================================================================
+
+# --- Configuration ---
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
+# Global state variables
 OS=""
-PKG_MGR=""
 DISTRO=""
+PKG_MGR=""
+CMD_PKG_INSTALL=""
+CMD_PKG_UPDATE=""
+
+# --- Logging Helpers ---
 
 function log() {
-    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "\033[0;32m[$(date +'%Y-%m-%d %H:%M:%S')] [INFO] $1\033[0m"
+}
+
+function warn() {
+    echo -e "\033[0;33m[$(date +'%Y-%m-%d %H:%M:%S')] [WARN] $1\033[0m"
 }
 
 function error_exit {
-    echo "[ERROR] $1" >&2
+    echo -e "\033[0;31m[ERROR] $1\033[0m" >&2
     exit 1
 }
 
-function check_os {
+# --- System Detection ---
+
+function detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=${ID:-linux}
@@ -24,147 +41,304 @@ function check_os {
     else
         error_exit "/etc/os-release not found. Unsupported OS."
     fi
-    
-    log "Detected OS: $OS, Distro: $DISTRO"
 
-    if [[ "$OS" =~ ^(ubuntu|debian)$ ]]; then
-        PKG_MGR="apt-get"
-    elif [[ "$OS" =~ ^(centos|rhel|almalinux|rocky|fedora)$ ]]; then
-        PKG_MGR="dnf"
-    else
-        error_exit "Unsupported OS: $OS"
-    fi
+    log "Detected OS: $OS ($VERSION_ID)"
+
+    case "$OS" in
+        ubuntu|debian)
+            PKG_MGR="apt-get"
+            CMD_PKG_UPDATE="sudo apt-get update"
+            CMD_PKG_INSTALL="sudo apt-get install -y"
+            ;;
+        centos|rhel|almalinux|rocky|fedora|ol)
+            PKG_MGR="dnf"
+            CMD_PKG_UPDATE="sudo dnf check-update || true" # dnf check-update returns 100 on updates avail
+            CMD_PKG_INSTALL="sudo dnf install -y"
+            ;;
+        opensuse*|sles)
+            PKG_MGR="zypper"
+            CMD_PKG_UPDATE="sudo zypper refresh"
+            CMD_PKG_INSTALL="sudo zypper install -y"
+            ;;
+        *)
+            error_exit "Unsupported Operating System: $OS"
+            ;;
+    esac
 }
 
-function install_dependencies {
-    log "Checking required dependencies..."
-    local install_list=""
-    
-    # dependencies array: "binary_command:package_name"
-    # Note: gnupg package provides 'gpg' command
-    deps=("openssl:openssl" "curl:curl" "gpg:gnupg")
+# --- Dependency Management ---
 
-    for entry in "${deps[@]}"; do
-        cmd="${entry%%:*}"
-        pkg="${entry##*:}"
+function install_pkg() {
+    local packages="$*"
+    log "Installing packages: $packages"
+    $CMD_PKG_INSTALL $packages
+}
+
+function check_and_install_deps() {
+    log "Checking system dependencies..."
+    local deps_missing=""
+    
+    # Map command names to package names where they differ
+    declare -A cmd_map
+    cmd_map=( ["openssl"]="openssl" ["curl"]="curl" ["gpg"]="gnupg" )
+
+    # Adjust for specific distros if needed (e.g. some might name it differently)
+    # For now, these are quite standard across the supported distros.
+
+    for cmd in "${!cmd_map[@]}"; do
         if ! command -v "$cmd" &> /dev/null; then
-            install_list="$install_list $pkg"
+            deps_missing="$deps_missing ${cmd_map[$cmd]}"
         fi
     done
 
-    if [ -n "$install_list" ]; then
-        log "Installing missing dependencies:$install_list"
-        if [[ "$PKG_MGR" == "apt-get" ]]; then
-            sudo $PKG_MGR update
-            sudo $PKG_MGR install -y $install_list
-        elif [[ "$PKG_MGR" == "dnf" ]]; then
-            sudo $PKG_MGR install -y $install_list
-        fi
+    if [ -n "$deps_missing" ]; then
+        log "Missing dependencies found: $deps_missing"
+        $CMD_PKG_UPDATE
+        install_pkg $deps_missing
         
-        # Determine if installations succeeded
-        for entry in "${deps[@]}"; do
-             cmd="${entry%%:*}"
-             pkg="${entry##*:}"
-             # Only check if we tried to install this package (simple string match check)
-             if [[ "$install_list" == *"$pkg"* ]]; then
-                if ! command -v "$cmd" &> /dev/null; then
-                     # Try hash -r to refresh shell cache
-                     hash -r
-                     if ! command -v "$cmd" &> /dev/null; then
-                         error_exit "Failed to install $pkg (command '$cmd' not found). Please install manually."
-                     fi
-                fi
+        # Verify
+        for cmd in "${!cmd_map[@]}"; do
+             if ! command -v "$cmd" &> /dev/null; then
+                 # Try hashing to clear cache
+                 hash -r
+                 if ! command -v "$cmd" &> /dev/null; then
+                     warn "Command '$cmd' still not found after installation. Proceeding with caution..."
+                 fi
              fi
         done
+    else
+        log "All system dependencies met."
     fi
 }
 
-function install_docker {
-    log "Installing Docker..."
+# --- Docker Installation ---
 
-    if [[ "$PKG_MGR" == "apt-get" ]]; then
-        # Ubuntu/Debian
-        sudo $PKG_MGR update
-        sudo $PKG_MGR install -y ca-certificates curl gnupg
-        sudo install -m 0755 -d /etc/apt/keyrings
-        
-        # Remove old key if exists to ensure freshness
-        sudo rm -f /etc/apt/keyrings/docker.gpg
-        curl -fsSL https://download.docker.com/linux/$OS/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        sudo chmod a+r /etc/apt/keyrings/docker.gpg
-
-        # Add the repository to Apt sources:
-        echo \
-          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS \
-          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-          sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        
-        sudo $PKG_MGR update
-        sudo $PKG_MGR install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-    elif [[ "$PKG_MGR" == "dnf" ]]; then
-        # CentOS/RHEL/Fedora/AlmaLinux/Rocky
-        # Docker doesn't have specific repos for Alma/Rocky, they use CentOS
-        if [[ "$OS" =~ ^(almalinux|rocky|rhel|centos)$ ]]; then
-            DOCKER_REPO_OS="centos"
+function install_docker() {
+    if command -v docker &> /dev/null; then
+        log "Docker is already installed."
+        # Check for compose
+        if docker compose version &>/dev/null; then
+            return 0
         else
-            DOCKER_REPO_OS="$OS"
+            log "Docker Compose plugin missing. Attempting to fix..."
         fi
-        
-        sudo $PKG_MGR install -y dnf-plugins-core
-        sudo dnf config-manager --add-repo https://download.docker.com/linux/$DOCKER_REPO_OS/docker-ce.repo
-        sudo $PKG_MGR install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    else
+        log "Installing Docker..."
     fi
 
+    case "$PKG_MGR" in
+        apt-get)
+            $CMD_PKG_UPDATE
+            install_pkg ca-certificates curl gnupg
+            sudo install -m 0755 -d /etc/apt/keyrings
+            sudo rm -f /etc/apt/keyrings/docker.gpg
+            curl -fsSL https://download.docker.com/linux/$OS/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$OS \
+              $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+              sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+            $CMD_PKG_UPDATE
+            install_pkg docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            ;;
+            
+        dnf)
+            # Handle RHEL/CentOS derivatives mapping
+            local docker_repo_os="$OS"
+            if [[ "$OS" =~ ^(almalinux|rocky|rhel|ol)$ ]]; then
+                docker_repo_os="centos"
+            fi
+            
+            install_pkg dnf-plugins-core
+            sudo dnf config-manager --add-repo https://download.docker.com/linux/$docker_repo_os/docker-ce.repo
+            install_pkg docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            ;;
+            
+        zypper)
+            # OpenSUSE / SLES 
+            log "Configuring Docker for OpenSUSE/SLES..."
+            sudo zypper addrepo --check --refresh https://download.docker.com/linux/sles/docker-ce.repo || true
+            sudo zypper --gpg-auto-import-keys refresh
+            
+            # Try Docker CE first
+            if ! sudo zypper install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+                warn "Failed to install Docker CE from official repo. Falling back to distro packages..."
+                install_pkg docker
+                
+                # Check for compose
+                if ! install_pkg docker-compose-plugin; then
+                     warn "docker-compose-plugin package not found. Installing binary manually..."
+                     install_manual_compose
+                fi
+            fi
+            ;;
+    esac
+
+    # Post-install Setup
     log "Starting Docker service..."
-    sudo systemctl enable --now docker
+    start_docker_service
     
-    # Check if docker is running
-    if ! systemctl is-active --quiet docker; then
-         error_exit "Docker failed to start."
-    fi
-    
-    log "Docker installed and running successfully."
-}
-
-function add_user_to_docker {
-    log "Adding user $USER to docker group..."
+    # Add user to group
     if ! getent group docker > /dev/null; then
         sudo groupadd docker
     fi
     sudo usermod -aG docker "$USER"
+    log "User $USER added to 'docker' group."
 }
 
-function check_firewall {
-    log "Checking firewall..."
-    if command -v ufw >/dev/null; then
-        if sudo ufw status | grep -q "Status: active"; then
-            sudo ufw allow 22/tcp  # Always good to ensure SSH is allowed
-            sudo ufw allow 8086/tcp # InfluxDB
-            sudo ufw allow 3000/tcp # Grafana
-            log "Configured UFW firewall rules."
+function install_manual_compose() {
+    local DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker/cli-plugins}
+    sudo mkdir -p $DOCKER_CONFIG
+    sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m) -o $DOCKER_CONFIG/docker-compose
+    sudo chmod +x $DOCKER_CONFIG/docker-compose
+    sudo ln -sf $DOCKER_CONFIG/docker-compose /usr/local/bin/docker-compose
+}
+
+function start_docker_service() {
+    # 1. Systemd Check
+    if sudo systemctl --version >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        sudo systemctl enable --now docker
+        return
+    fi
+    
+    # 2. Legacy Service Check
+    if command -v service >/dev/null; then
+        log "Systemd not active. Trying 'service' command..."
+        sudo service docker start || true
+    fi
+    
+    # 3. Validation & WSL Help
+    if ! sudo docker info >/dev/null 2>&1; then
+        if grep -qEi "(Microsoft|WSL)" /proc/version &> /dev/null; then
+             echo ""
+             error_exit "Docker failed to start.
+--------------------------------------------------------------------------------
+DETECTED WSL ENVIRONMENT WITHOUT SYSTEMD
+You must enable systemd for Docker to work correctly.
+
+1. Edit wsl.conf:  sudo nano /etc/wsl.conf
+2. Add these lines:
+   [boot]
+   systemd=true
+3. Restart WSL:    wsl --shutdown (in PowerShell)
+--------------------------------------------------------------------------------"
         fi
-    elif command -v firewall-cmd >/dev/null; then
-        if sudo firewall-cmd --state &>/dev/null; then
-            sudo firewall-cmd --permanent --add-port=8086/tcp
-            sudo firewall-cmd --permanent --add-port=3000/tcp
-            sudo firewall-cmd --reload
-            log "Configured firewalld rules."
-        fi
+        error_exit "Docker failed to start. Please check system logs."
     fi
 }
 
-function generate_docker_compose {
-    log "Generating docker-compose.yml..."
-    # Always regenerate to ensure variables are updated
-    cat <<EOF | tee docker-compose.yml > /dev/null
-services:
+function check_firewall() {
+    if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
+        log "Configuring UFW..."
+        sudo ufw allow 8086/tcp
+        sudo ufw allow 3000/tcp
+    elif command -v firewall-cmd >/dev/null && sudo firewall-cmd --state &>/dev/null; then
+        log "Configuring Firewalld..."
+        sudo firewall-cmd --permanent --add-port=8086/tcp
+        sudo firewall-cmd --permanent --add-port=3000/tcp
+        sudo firewall-cmd --reload
+    fi
+}
 
+# --- Configuration Generators ---
+
+function generate_env() {
+    log "Generating Environment Variables..."
+    
+    # Credentials
+    if [ ! -f .env.influxdb-admin-username ]; then
+        read -p "InfluxDB Admin Username: " admuser
+        echo "$admuser" > .env.influxdb-admin-username
+    fi
+    
+    if [ ! -f .env.influxdb-admin-password ]; then
+        while true; do
+            read -s -p "InfluxDB Admin Password (8+ chars): " admpass
+            echo
+            if [ ${#admpass} -ge 8 ]; then break; fi
+            warn "Password too short."
+        done
+        echo "$admpass" > .env.influxdb-admin-password
+    fi
+    
+    if [ ! -f .env.influxdb-admin-token ]; then
+        echo "$(openssl rand -hex 32)" > .env.influxdb-admin-token
+        log "Generated new InfluxDB Token."
+    fi
+    
+    # Settings (Memory only for current run, unless persisted)
+    if [ -z "${INFLUX_ORG:-}" ]; then
+        read -p "InfluxDB Org Name [docs]: " input_org
+        export INFLUX_ORG=${input_org:-docs}
+    fi
+    
+    if [ -z "${INFLUX_BUCKET:-}" ]; then
+        read -p "InfluxDB Bucket Name [home]: " input_bucket
+        export INFLUX_BUCKET=${input_bucket:-home}
+    fi
+}
+
+function gen_configs() {
+    log "Generating Config Files..."
+    mkdir -p influxdb/data influxdb/config
+    mkdir -p telegraf-config/telegraf.d
+
+    # Telegraf
+    if [ ! -f telegraf-config/telegraf.conf ]; then
+        cat <<EOF > telegraf-config/telegraf.conf
+[global_tags]
+  server_name = "$(hostname)"
+[agent]
+  interval = "30s"
+  round_interval = true
+  metric_batch_size = 1000
+  metric_buffer_limit = 10000
+  collection_jitter = "0s"
+  flush_interval = "10s"
+  flush_jitter = "0s"
+  precision = "0s"
+  hostname = ""
+  omit_hostname = false
+EOF
+    fi
+
+    if [ ! -f telegraf-config/telegraf.d/100-inputs.conf ]; then
+        cat <<EOF > telegraf-config/telegraf.d/100-inputs.conf
+[[inputs.cpu]]
+  percpu = true
+  totalcpu = true
+  collect_cpu_time = false
+  report_active = false
+[[inputs.disk]]
+  ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
+[[inputs.diskio]]
+[[inputs.mem]]
+[[inputs.net]]
+[[inputs.system]]
+EOF
+    fi
+    
+    # Telegraf Output (Regen if force or missing)
+    if [ -f .env.influxdb-admin-token ]; then
+        local token=$(cat .env.influxdb-admin-token)
+        cat <<EOF > telegraf-config/telegraf.d/000-influxdb.conf
+[[outputs.influxdb_v2]]
+  urls = ["http://influxdb:8086"]
+  token = "$token"
+  organization = "${INFLUX_ORG:-docs}"
+  bucket = "${INFLUX_BUCKET:-home}"
+EOF
+    fi
+    
+    # Docker Compose
+    cat <<EOF > docker-compose.yml
+services:
   influxdb:
     image: influxdb:latest
     container_name: influxdb
-    ports:
-      - "8086:8086"
+    ports: ["8086:8086"]
     environment:
       INFLUXDB_HTTP_AUTH_ENABLED: "true"
       DOCKER_INFLUXDB_INIT_MODE: setup
@@ -185,8 +359,7 @@ services:
   grafana:
     image: grafana/grafana-oss:latest
     container_name: grafana
-    ports:
-      - "3000:3000"
+    ports: ["3000:3000"]
     volumes:
       - grafana-data:/var/lib/grafana
     depends_on:
@@ -207,6 +380,7 @@ volumes:
   influxdb-data:
   influxdb-config:
   grafana-data:
+
 secrets:
   influxdb-admin-username:
     file: .env.influxdb-admin-username
@@ -214,229 +388,52 @@ secrets:
     file: .env.influxdb-admin-password
   influxdb-admin-token:
     file: .env.influxdb-admin-token
-    
+
 networks:
   default:
     name: tig-network
 EOF
 }
 
-function create_folder {
-    local m_path=$1
-    mkdir -p "$m_path"
-}
+# --- Health Checks ---
 
-function gen_telegraf {
-    create_folder telegraf-config
-    create_folder telegraf-config/telegraf.d
-    
-    # 1. Main Config with Global Tags
-    if [ ! -f telegraf-config/telegraf.conf ]; then
-        log "Creating basic Telegraf config..."
-        cat <<EOF > telegraf-config/telegraf.conf
-[global_tags]
-  server_name = "$(hostname)"
-
-[agent]
-  interval = "30s"
-  round_interval = true
-  metric_batch_size = 1000
-  metric_buffer_limit = 10000
-  collection_jitter = "0s"
-  flush_interval = "10s"
-  flush_jitter = "0s"
-  precision = "0s"
-  hostname = ""
-  omit_hostname = false
-EOF
-    fi
-
-    # 2. System Inputs (CPU, Mem, Disk, Net)
-    # Fixes "no inputs found" error
-    if [ ! -f telegraf-config/telegraf.d/100-inputs.conf ]; then
-        log "Creating system metrics inputs..."
-        cat <<EOF > telegraf-config/telegraf.d/100-inputs.conf
-[[inputs.cpu]]
-  percpu = true
-  totalcpu = true
-  collect_cpu_time = false
-  report_active = false
-
-[[inputs.disk]]
-  ignore_fs = ["tmpfs", "devtmpfs", "devfs", "iso9660", "overlay", "aufs", "squashfs"]
-
-[[inputs.diskio]]
-
-[[inputs.mem]]
-
-[[inputs.net]]
-
-[[inputs.system]]
-EOF
-    fi
-
-    # 3. Output to InfluxDB
-    if [ -f .env.influxdb-admin-token ]; then
-        RDTOKEN=$(cat .env.influxdb-admin-token)
-        # Use globally set INFLUX_ORG and INFLUX_BUCKET
-        if [ ! -f telegraf-config/telegraf.d/000-influxdb.conf ] || [ "$FORCE_REGEN" == "true" ]; then
-            log "Configuring Telegraf output..."
-             
-            cat <<EOF > telegraf-config/telegraf.d/000-influxdb.conf
-[[outputs.influxdb_v2]]
-  urls = ["http://influxdb:8086"]
-  token = "$RDTOKEN"
-  organization = "${INFLUX_ORG:-docs}"
-  bucket = "${INFLUX_BUCKET:-home}"
-EOF
-        fi
-    fi
-}
-
-function gen_influxdb {
-    create_folder influxdb
-    create_folder influxdb/data
-    create_folder influxdb/config
-}
-
-function generate_envfile {
-    if [ ! -f .env.influxdb-admin-username ]; then
-        read -p "InfluxDB admin username: " admuser
-        echo "$admuser" > .env.influxdb-admin-username
-    fi
-
-    if [ ! -f .env.influxdb-admin-password ]; then
-        while true; do
-            read -s -p "InfluxDB admin password (8-72 chars): " admpass
-            echo
-            len=${#admpass}
-            if [ "$len" -ge 8 ] && [ "$len" -le 72 ]; then
-                break
-            else
-                echo "Password length must be between 8 and 72 characters."
-            fi
-        done
-        echo "$admpass" > .env.influxdb-admin-password
-    fi
-    
-    if [ ! -f .env.influxdb-admin-token ]; then
-        INFLUX_TOKEN=$(openssl rand -hex 32)
-        echo "$INFLUX_TOKEN" > .env.influxdb-admin-token
-		log "Generated InfluxDB Token: success"
-        
-    fi
-    
-    # Prompt for Org and Bucket here to ensure they are available for both compose and telegraf
-    # We don't save these to files unless we want to persist them across runs, 
-    # but for now we'll just prompt if not set.
-    if [ -z "${INFLUX_ORG:-}" ]; then
-        read -p "InfluxDB Organization Name [docs]: " input_org
-        INFLUX_ORG=${input_org:-docs}
-    fi
-    
-    if [ -z "${INFLUX_BUCKET:-}" ]; then
-        read -p "InfluxDB Bucket Name [home]: " input_bucket
-        INFLUX_BUCKET=${input_bucket:-home}
-    fi
-}
-
-
-
-function rundocker {
-    log "Pulling Docker images..."
+function wait_for_services() {
+    log "Pulling and Starting Services..."
     sudo docker compose pull
-    
-    log "Starting TIG Stack with Docker Compose..."
     sudo docker compose up -d
-}
 
-function checkup_influx {
-    log "Waiting for InfluxDB to be ready..."
-    INFLUXCNF="./telegraf-config/telegraf.d/000-influxdb.conf"
-    
-    # Attempt to read creds
-    local user=$(cat .env.influxdb-admin-username)
-    local pass=$(cat .env.influxdb-admin-password)
-    local token=$(cat .env.influxdb-admin-token)
-    
-    # Try to extract from config if available, otherwise default
-    local org="docs"
-    local bket="home"
-    if [ -f "$INFLUXCNF" ]; then
-        org_grep=$(grep -E '^\s*organization\s*=' "$INFLUXCNF" | sed -E 's/.*=\s*"(.*)"/\1/')
-        bket_grep=$(grep -E '^\s*bucket\s*=' "$INFLUXCNF" | sed -E 's/.*=\s*"(.*)"/\1/')
-        [ -n "$org_grep" ] && org=$org_grep
-        [ -n "$bket_grep" ] && bket=$bket_grep
-    fi
-
-    HOST_URL="http://localhost:8086"
-    
-    # Wait loop
+    log "Waiting for InfluxDB health..."
     local retries=30
     local count=0
-    until curl -s "$HOST_URL/health" | grep -q '"status":"pass"'; do
+    until curl -s "http://localhost:8086/health" | grep -q '"status":"pass"'; do
         sleep 2
         echo -n "."
         count=$((count+1))
         if [ $count -ge $retries ]; then
-            echo
-            log "Timeout waiting for InfluxDB."
-            return 1
+            echo ""
+            error_exit "Timeout waiting for InfluxDB to start."
         fi
     done
-    echo
-    log "InfluxDB is healthy."
-
-    # NOTE: With DOCKER_INFLUXDB_INIT_* env vars, the setup happens automatically on first run.
-    # explicit 'influx setup' command might fail if it's already set up.
-    # We check if we can ping it with the token.
-    
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Token $token" "$HOST_URL/api/v2/orgs")
-    if [[ "$http_code" == "200" ]]; then
-       log "InfluxDB authenticated successfully."
-    else
-       log "Automatic setup might be running or manual setup required."
-       # Optional: could force setup here if needed, but the init vars usually handle it.
-    fi
+    echo ""
+    log "InfluxDB is Healthy."
 }
 
-# Main Execution Logic
+# --- Main ---
 
-check_os
-install_dependencies
+log "Starting TiG Stack Setup..."
+detect_os
+check_and_install_deps
+install_docker
+check_firewall
 
-# Check if Docker is installed
-if ! command -v docker &> /dev/null; then
-    install_docker
-    add_user_to_docker
-    check_firewall
-    log "Docker installation complete."
-    log "NOTE: You may need to log out and log back in for group membership to take effect."
-    
-    # If we just installed docker, we might not be able to run docker commands without sudo yet (in this shell)
-    # We can try to use 'sg' or just warn the user.
-else
-    log "Docker is already installed."
-    # Ensure compose plugin is there
-    if ! docker compose version &>/dev/null; then
-         log "Docker Compose plugin not found. Attempting to install..."
-         install_docker
-    fi
-fi
-
-# Proceed with TIG stack setup
-
-generate_envfile
-gen_influxdb
-gen_telegraf
-generate_docker_compose
-rundocker
-checkup_influx
+# Setup App
+generate_env
+gen_configs
+wait_for_services
 
 log "========================================================"
-log "Installation Finished."
-log "Grafana: http://localhost:3000 (default: admin/admin)"
+log "Installation Finished Successfully."
+log "Grafana:  http://localhost:3000 (default: admin/admin)"
 log "InfluxDB: http://localhost:8086"
-log "InfluxDB Token: $INFLUX_TOKEN"
-log "Credentials stored in .env.* files."
+log "Token:    $(cat .env.influxdb-admin-token)"
 log "========================================================"
